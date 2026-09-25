@@ -10,14 +10,26 @@ from sqlalchemy.orm import Session
 from . import services
 from .db import get_db
 from .schemas import (
+    CapacityIn,
+    CapacityOut,
+    ConflictPreviewIn,
+    ConflictPreviewOut,
     DiffOut,
     EventBatchIn,
     FreezeIn,
+    ImpactQueryOut,
     ImportResult,
     PlanIn,
     PlanOut,
+    RosterConfirmIn,
+    RosterConfirmOut,
+    ScheduleImpactOut,
+    ScheduleIn,
+    ScheduleOut,
     SnapshotOut,
     StudentProgressOut,
+    VenueIn,
+    VenueOut,
 )
 
 router = APIRouter(prefix="/api")
@@ -160,3 +172,195 @@ def get_diff(
         )
     except (services.PlanNotFoundError, services.FreezeNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# 场地与容量版本
+# ---------------------------------------------------------------------------
+
+
+@router.post("/venues", response_model=VenueOut, status_code=status.HTTP_201_CREATED)
+def post_venue(body: VenueIn, db: Session = Depends(get_db)) -> Any:
+    return services.configure_venue(db, venue_id=body.venue_id, name=body.name)
+
+
+@router.get("/venues", response_model=list[VenueOut])
+def get_venues(db: Session = Depends(get_db)) -> Any:
+    return services.list_venues(db)
+
+
+@router.post(
+    "/venues/{venue_id}/capacity-versions",
+    response_model=CapacityOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def post_capacity(
+    venue_id: str, body: CapacityIn, db: Session = Depends(get_db)
+) -> Any:
+    try:
+        return services.configure_capacity(
+            db,
+            venue_id=venue_id,
+            capacity_version=body.capacity_version,
+            capacity=body.capacity,
+            effective_from=body.effective_from,
+        )
+    except services.CapacityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/venues/{venue_id}/capacity-versions", response_model=list[CapacityOut])
+def get_capacity_versions(
+    venue_id: str, db: Session = Depends(get_db)
+) -> Any:
+    return services.list_capacities(db, venue_id=venue_id)
+
+
+# ---------------------------------------------------------------------------
+# 活动排期版本
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/plans/{plan_version}/schedule-versions",
+    response_model=ScheduleOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def post_schedule(
+    plan_version: str, body: ScheduleIn, db: Session = Depends(get_db)
+) -> Any:
+    try:
+        return services.configure_schedule(
+            db,
+            plan_version=plan_version,
+            schedule_version=body.schedule_version,
+            entries=[e.model_dump() for e in body.entries],
+            set_active=body.set_active,
+        )
+    except services.PlanNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except services.CapacityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get(
+    "/plans/{plan_version}/schedule-versions",
+    response_model=list[ScheduleOut],
+)
+def get_schedules(plan_version: str, db: Session = Depends(get_db)) -> Any:
+    try:
+        return services.list_schedules(db, plan_version)
+    except services.PlanNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post(
+    "/plans/{plan_version}/schedule-versions/{schedule_version}/activate",
+    response_model=ScheduleOut,
+)
+def activate_schedule_route(
+    plan_version: str,
+    schedule_version: str,
+    db: Session = Depends(get_db),
+) -> Any:
+    try:
+        return services.activate_schedule(
+            db, plan_version=plan_version, schedule_version=schedule_version
+        )
+    except services.PlanNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except services.CapacityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# 冲突预览、名单确认与影响查询
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/plans/{plan_version}/conflict-preview",
+    response_model=ConflictPreviewOut,
+)
+def post_conflict_preview(
+    plan_version: str, body: ConflictPreviewIn, db: Session = Depends(get_db)
+) -> Any:
+    try:
+        return services.preview_conflicts(
+            db,
+            plan_version=plan_version,
+            schedule_version=body.schedule_version,
+            what_if_capacity=body.what_if_capacity,
+        )
+    except services.PlanNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except services.CapacityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/plans/{plan_version}/roster-confirmations",
+    response_model=RosterConfirmOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def post_roster_confirm(
+    plan_version: str, body: RosterConfirmIn, db: Session = Depends(get_db)
+) -> Any:
+    try:
+        return services.confirm_roster(
+            db,
+            plan_version=plan_version,
+            event_id=body.event_id,
+            activity_id=body.activity_id,
+            student_ids=body.student_ids,
+            actor_id=body.actor_id,
+            partial=body.partial,
+        )
+    except services.PlanNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except services.CapacityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get(
+    "/plans/{plan_version}/impact",
+    response_model=ImpactQueryOut,
+)
+def get_impact(
+    plan_version: str,
+    student_id: str | None = None,
+    activity_id: str | None = None,
+    db: Session = Depends(get_db),
+) -> Any:
+    try:
+        return services.impact_query(
+            db,
+            plan_version=plan_version,
+            student_id=student_id,
+            activity_id=activity_id,
+        )
+    except services.PlanNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/plans/{plan_version}/schedule-versions/{schedule_version}/impact/{other_version}",
+    response_model=ScheduleImpactOut,
+)
+def get_schedule_impact(
+    plan_version: str,
+    schedule_version: str,
+    other_version: str,
+    db: Session = Depends(get_db),
+) -> Any:
+    try:
+        return services.schedule_version_impact(
+            db,
+            plan_version=plan_version,
+            old_version=schedule_version,
+            new_version=other_version,
+        )
+    except services.PlanNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except services.CapacityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

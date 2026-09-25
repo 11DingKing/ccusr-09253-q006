@@ -69,3 +69,69 @@ class Freeze(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow, server_default=func.now()
     )
+
+
+class Venue(Base):
+    __tablename__ = "venues"
+
+    venue_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, server_default=func.now()
+    )
+
+
+class CapacityVersion(Base):
+    """场地容量版本：同一容量版本号在一场活动窗口内保持稳定。"""
+
+    __tablename__ = "capacity_versions"
+
+    venue_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    capacity_version: Mapped[str] = mapped_column(String(128), primary_key=True)
+    capacity: Mapped[int] = mapped_column(Integer, nullable=False)
+    effective_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("capacity >= 0", name="ck_capacity_nonneg"),
+    )
+
+
+class ScheduleVersion(Base):
+    """活动排期版本；更正排期即写入新版本，旧版本保留供影响对比。"""
+
+    __tablename__ = "schedule_versions"
+
+    schedule_version: Mapped[str] = mapped_column(String(128), primary_key=True)
+    activity_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    plan_version: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    venue_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    start_utc: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    end_utc: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_schedule_plan_activity", "plan_version", "activity_id"),
+    )
+
+
+class ScheduleBaseline(Base):
+    """培养方案当前启用的排期版本；切换只重算受影响活动。"""
+
+    __tablename__ = "schedule_baselines"
+
+    plan_version: Mapped[str] = mapped_column(String(128), primary_key=True)
+    schedule_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, server_default=func.now()
+    )

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -25,6 +25,9 @@ class Snapshot:
     generated_at: str
     event_cutoff_id: str | None
     students: list[dict[str, Any]]
+    schedule_version: str | None = None
+    capacity_versions: dict[str, str] = field(default_factory=dict)
+    overages: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -35,6 +38,9 @@ class Snapshot:
             "generated_at": self.generated_at,
             "event_cutoff_id": self.event_cutoff_id,
             "students": self.students,
+            "schedule_version": self.schedule_version,
+            "capacity_versions": self.capacity_versions,
+            "overages": self.overages,
         }
 
     @classmethod
@@ -47,6 +53,9 @@ class Snapshot:
             generated_at=data["generated_at"],
             event_cutoff_id=data.get("event_cutoff_id"),
             students=list(data.get("students", [])),
+            schedule_version=data.get("schedule_version"),
+            capacity_versions=dict(data.get("capacity_versions", {})),
+            overages=list(data.get("overages", [])),
         )
 
 
@@ -55,10 +64,12 @@ def _student_to_dict(progress: StudentProgress, tz_name: str) -> dict[str, Any]:
         "student_id": progress.student_id,
         "confirmed_seconds": progress.confirmed_seconds,
         "pending_seconds": progress.pending_seconds,
+        "held_seconds": progress.held_seconds,
         "adjustment_seconds": progress.adjustment_seconds,
         "total_seconds": progress.total_seconds,
         "lesson_units": progress.lesson_units,
         "pending_lesson_units": progress.pending_lesson_units,
+        "held_lesson_units": progress.held_lesson_units,
         "meets_requirement": progress.meets_requirement,
         "daily": [
             {"academic_day": d.academic_day, "seconds": d.seconds}
@@ -85,6 +96,8 @@ def build_snapshot(
     freeze_id: str | None = None,
     event_cutoff_id: str | None = None,
     generated_at: datetime | None = None,
+    capacities: list | None = None,
+    schedules: list | None = None,
 ) -> Snapshot:
     """执行确定性的业务处理。"""
     state: ReplayState = replay(
@@ -93,6 +106,8 @@ def build_snapshot(
         timezone_name=timezone_name,
         required_seconds=required_seconds,
         up_to_event_id=event_cutoff_id,
+        capacities=capacities,
+        schedules=schedules,
     )
     if generated_at is None:
         generated_at = datetime.now(timezone.utc)
@@ -111,6 +126,9 @@ def build_snapshot(
         generated_at=generated_at.isoformat().replace("+00:00", "Z"),
         event_cutoff_id=event_cutoff_id,
         students=students,
+        schedule_version=state.schedule_version,
+        capacity_versions=state.capacity_refs,
+        overages=state.overages,
     )
 
 
@@ -161,10 +179,12 @@ def diff_snapshots(old: Snapshot, new: Snapshot) -> dict[str, Any]:
         fields = (
             "confirmed_seconds",
             "pending_seconds",
+            "held_seconds",
             "adjustment_seconds",
             "total_seconds",
             "lesson_units",
             "pending_lesson_units",
+            "held_lesson_units",
             "meets_requirement",
         )
         changed_fields = {}
