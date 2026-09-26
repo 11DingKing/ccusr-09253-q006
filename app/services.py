@@ -84,14 +84,27 @@ def import_events(
     }
 
 
+def _capacity_context(db: Session, plan_version: str):
+    """加载当前生效的排期/容量版本；未配置任何场地时返回 None。"""
+    from .capacity_services import _load_context
+
+    schedules, capacities = _load_context(db, plan_version)
+    if not schedules and not capacities:
+        return None
+    return schedules, capacities
+
+
 def current_snapshot(db: Session, plan_version: str) -> Snapshot:
     plan = _require_plan(db, plan_version)
     events = load_events(db, plan_version)
+    context = _capacity_context(db, plan_version)
     return build_snapshot(
         events,
         plan_version=plan_version,
         timezone_name=plan.iana_timezone,
         required_seconds=plan.required_seconds,
+        schedules=context[0] if context else None,
+        capacities=context[1] if context else None,
     )
 
 
@@ -113,6 +126,7 @@ def freeze_semester(
 
     cutoff = max_event_id(db, plan_version)
     events = load_events(db, plan_version)
+    context = _capacity_context(db, plan_version)
     snap = build_snapshot(
         events,
         plan_version=plan_version,
@@ -120,6 +134,8 @@ def freeze_semester(
         required_seconds=plan.required_seconds,
         freeze_id=freeze_id,
         event_cutoff_id=cutoff,
+        schedules=context[0] if context else None,
+        capacities=context[1] if context else None,
     )
     row = insert_freeze(
         db,

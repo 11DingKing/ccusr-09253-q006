@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
+from .capacity import ActivitySchedule, VenueCapacity
 from .replay import (
     CheckinRecord,
     Event,
@@ -25,6 +26,9 @@ class Snapshot:
     generated_at: str
     event_cutoff_id: str | None
     students: list[dict[str, Any]]
+    schedule_versions: dict[str, str] | None = None
+    venue_versions: dict[str, str] | None = None
+    overruns: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -35,6 +39,9 @@ class Snapshot:
             "generated_at": self.generated_at,
             "event_cutoff_id": self.event_cutoff_id,
             "students": self.students,
+            "schedule_versions": self.schedule_versions,
+            "venue_versions": self.venue_versions,
+            "overruns": self.overruns,
         }
 
     @classmethod
@@ -47,6 +54,9 @@ class Snapshot:
             generated_at=data["generated_at"],
             event_cutoff_id=data.get("event_cutoff_id"),
             students=list(data.get("students", [])),
+            schedule_versions=data.get("schedule_versions"),
+            venue_versions=data.get("venue_versions"),
+            overruns=data.get("overruns"),
         )
 
 
@@ -60,6 +70,8 @@ def _student_to_dict(progress: StudentProgress, tz_name: str) -> dict[str, Any]:
         "lesson_units": progress.lesson_units,
         "pending_lesson_units": progress.pending_lesson_units,
         "meets_requirement": progress.meets_requirement,
+        "held_seconds": progress.held_seconds,
+        "excluded_seconds": progress.excluded_seconds,
         "daily": [
             {"academic_day": d.academic_day, "seconds": d.seconds}
             for d in progress.daily
@@ -73,6 +85,34 @@ def _student_to_dict(progress: StudentProgress, tz_name: str) -> dict[str, Any]:
             }
             for a in progress.adjustments
         ],
+        "capacity_holds": [
+            {
+                "checkin_event_id": h.checkin_event_id,
+                "activity_id": h.activity_id,
+                "schedule_id": h.schedule_id,
+                "venue_id": h.venue_id,
+                "start_utc": h.start_utc.isoformat().replace("+00:00", "Z"),
+                "end_utc": h.end_utc.isoformat().replace("+00:00", "Z"),
+                "seconds": h.seconds,
+                "state": h.state,
+                "decision_event_id": h.decision_event_id,
+            }
+            for h in progress.capacity_holds
+        ],
+    }
+
+
+def _overrun_to_dict(window: Any) -> dict[str, Any]:
+    return {
+        "venue_id": window.venue_id,
+        "start_utc": window.start_utc.isoformat().replace("+00:00", "Z"),
+        "end_utc": window.end_utc.isoformat().replace("+00:00", "Z"),
+        "seconds": int((window.end_utc - window.start_utc).total_seconds()),
+        "capacity": window.capacity,
+        "headcount": window.headcount,
+        "schedule_ids": list(window.schedule_ids),
+        "held_student_ids": list(window.held_student_ids),
+        "excluded_student_ids": list(window.excluded_student_ids),
     }
 
 
@@ -85,6 +125,8 @@ def build_snapshot(
     freeze_id: str | None = None,
     event_cutoff_id: str | None = None,
     generated_at: datetime | None = None,
+    schedules: Sequence[ActivitySchedule] | None = None,
+    capacities: dict[str, VenueCapacity] | None = None,
 ) -> Snapshot:
     """执行确定性的业务处理。"""
     state: ReplayState = replay(
@@ -93,6 +135,8 @@ def build_snapshot(
         timezone_name=timezone_name,
         required_seconds=required_seconds,
         up_to_event_id=event_cutoff_id,
+        schedules=schedules,
+        capacities=capacities,
     )
     if generated_at is None:
         generated_at = datetime.now(timezone.utc)
@@ -103,6 +147,20 @@ def build_snapshot(
         for sid in sorted(state.students)
     ]
 
+    schedule_versions = (
+        {s.schedule_id: s.version for s in schedules} if schedules is not None else None
+    )
+    venue_versions = (
+        {vid: cap.version for vid, cap in capacities.items()}
+        if capacities is not None
+        else None
+    )
+    overruns = (
+        [_overrun_to_dict(w) for w in state.overruns]
+        if capacities is not None
+        else None
+    )
+
     return Snapshot(
         plan_version=plan_version,
         freeze_id=freeze_id,
@@ -111,6 +169,9 @@ def build_snapshot(
         generated_at=generated_at.isoformat().replace("+00:00", "Z"),
         event_cutoff_id=event_cutoff_id,
         students=students,
+        schedule_versions=schedule_versions,
+        venue_versions=venue_versions,
+        overruns=overruns,
     )
 
 
@@ -166,6 +227,8 @@ def diff_snapshots(old: Snapshot, new: Snapshot) -> dict[str, Any]:
             "lesson_units",
             "pending_lesson_units",
             "meets_requirement",
+            "held_seconds",
+            "excluded_seconds",
         )
         changed_fields = {}
         for field_name in fields:

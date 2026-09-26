@@ -5,8 +5,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
+from .capacity import (
+    ActivitySchedule,
+    EXCLUDED,
+    HELD,
+    RosterDecision,
+    SEATED,
+    VenueCapacity,
+    build_attendance_clips,
+    scan_capacity,
+)
 from .clock import (
     academic_day,
     elapsed_seconds,
@@ -21,6 +31,7 @@ class EventType(StrEnum):
     CHECKIN = "checkin"
     MENTOR_CONFIRM = "mentor_confirm"
     LEAVE_CORRECTION = "leave_correction"
+    ROSTER_CONFIRM = "roster_confirm"
 
 
 class CheckinStatus(StrEnum):
@@ -52,6 +63,10 @@ class CheckinRecord:
     start_utc: datetime
     end_utc: datetime
     status: CheckinStatus
+    seated_intervals: list[tuple[datetime, datetime]] = field(default_factory=list)
+    held_intervals: list[tuple[datetime, datetime]] = field(default_factory=list)
+    excluded_intervals: list[tuple[datetime, datetime]] = field(default_factory=list)
+    capacity_evaluated: bool = False
 
     @property
     def seconds(self) -> int:
@@ -59,7 +74,23 @@ class CheckinRecord:
 
     @property
     def counts(self) -> bool:
-        return self.status == CheckinStatus.CONFIRMED
+        if self.status != CheckinStatus.CONFIRMED:
+            return False
+        if not self.capacity_evaluated:
+            return True
+        return bool(self.seated_intervals)
+
+    @property
+    def seated_seconds(self) -> int:
+        return union_seconds(self.seated_intervals)
+
+    @property
+    def held_seconds(self) -> int:
+        return union_seconds(self.held_intervals)
+
+    @property
+    def excluded_seconds(self) -> int:
+        return union_seconds(self.excluded_intervals)
 
 
 @dataclass
@@ -77,6 +108,19 @@ class DayTotal:
 
 
 @dataclass
+class CapacityHold:
+    checkin_event_id: str
+    activity_id: str
+    schedule_id: str
+    venue_id: str
+    start_utc: datetime
+    end_utc: datetime
+    seconds: int
+    state: str
+    decision_event_id: str | None = None
+
+
+@dataclass
 class StudentProgress:
     student_id: str
     confirmed_seconds: int
@@ -89,6 +133,21 @@ class StudentProgress:
     daily: list[DayTotal] = field(default_factory=list)
     checkins: list[CheckinRecord] = field(default_factory=list)
     adjustments: list[Adjustment] = field(default_factory=list)
+    held_seconds: int = 0
+    excluded_seconds: int = 0
+    capacity_holds: list[CapacityHold] = field(default_factory=list)
+
+
+@dataclass
+class OverrunWindow:
+    venue_id: str
+    start_utc: datetime
+    end_utc: datetime
+    capacity: int
+    headcount: int
+    schedule_ids: tuple[str, ...]
+    held_student_ids: tuple[str, ...]
+    excluded_student_ids: tuple[str, ...]
 
 
 @dataclass
@@ -97,6 +156,7 @@ class ReplayState:
     timezone: str
     required_seconds: int
     students: dict[str, StudentProgress]
+    overruns: list[OverrunWindow] = field(default_factory=list)
 
 
 def _parse_checkin(
@@ -120,6 +180,26 @@ def _parse_checkin(
     )
 
 
+def _subtract_intervals(
+    base: tuple[datetime, datetime],
+    covered: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """从 base 中扣除 covered 区间，返回剩余片段。"""
+    start, end = to_utc(base[0]), to_utc(base[1])
+    pieces: list[tuple[datetime, datetime]] = []
+    cursor = start
+    for cov_start, cov_end in merge_intervals(covered):
+        cov_start = max(to_utc(cov_start), start)
+        cov_end = min(to_utc(cov_end), end)
+        if cov_start > cursor:
+            pieces.append((cursor, min(cov_start, end)))
+        if cov_end > cursor:
+            cursor = cov_end
+    if cursor < end:
+        pieces.append((cursor, end))
+    return pieces
+
+
 def replay(
     events: Iterable[Event],
     *,
@@ -127,6 +207,8 @@ def replay(
     timezone_name: str,
     required_seconds: int,
     up_to_event_id: str | None = None,
+    schedules: Sequence[ActivitySchedule] | None = None,
+    capacities: dict[str, VenueCapacity] | None = None,
 ) -> ReplayState:
     """执行确定性的业务处理。"""
     sorted_events = sorted(
@@ -139,6 +221,7 @@ def replay(
     checkins_by_student: dict[str, list[CheckinRecord]] = {}
     checkin_index: dict[str, CheckinRecord] = {}
     adjustments_by_student: dict[str, list[Adjustment]] = {}
+    decisions: list[RosterDecision] = []
 
     for event in sorted_events:
         if event.event_type == EventType.CHECKIN:
@@ -160,6 +243,67 @@ def replay(
                     reason=str(event.payload.get("reason", "")),
                 )
             )
+        elif event.event_type == EventType.ROSTER_CONFIRM:
+            decisions.append(
+                RosterDecision(
+                    event_id=event.event_id,
+                    schedule_id=str(event.payload["schedule_id"]),
+                    released=tuple(event.payload.get("released", [])),
+                    excluded=tuple(event.payload.get("excluded", [])),
+                )
+            )
+
+    # 容量扫描：只有导师状态已确认的签到才实际占用场地。
+    overruns: list[OverrunWindow] = []
+    capacity_context = bool(schedules) and capacities is not None
+    if capacity_context:
+        confirmed_records = [
+            record
+            for records in checkins_by_student.values()
+            for record in records
+            if record.status == CheckinStatus.CONFIRMED
+        ]
+        clips = build_attendance_clips(confirmed_records, list(schedules or []))
+        scan = scan_capacity(clips, capacities or {}, decisions)
+
+        marks_by_checkin: dict[str, list] = {}
+        for mark in scan.marks:
+            marks_by_checkin.setdefault(mark.checkin_event_id, []).append(mark)
+
+        for record in confirmed_records:
+            marks = marks_by_checkin.get(record.event_id, [])
+            covered = merge_intervals([(m.start_utc, m.end_utc) for m in marks])
+            # 没有任何排期覆盖的时段视为不受容量限制，正常计入学时。
+            uncovered = _subtract_intervals(
+                (record.start_utc, record.end_utc), covered
+            )
+            seated = uncovered + [
+                (m.start_utc, m.end_utc) for m in marks if m.state == SEATED
+            ]
+            held = [
+                (m.start_utc, m.end_utc) for m in marks if m.state == HELD
+            ]
+            excluded = [
+                (m.start_utc, m.end_utc) for m in marks if m.state == EXCLUDED
+            ]
+            record.seated_intervals = merge_intervals(seated)
+            record.held_intervals = merge_intervals(held)
+            record.excluded_intervals = merge_intervals(excluded)
+            record.capacity_evaluated = True
+
+        overruns = [
+            OverrunWindow(
+                venue_id=segment.venue_id,
+                start_utc=segment.start_utc,
+                end_utc=segment.end_utc,
+                capacity=segment.capacity,
+                headcount=segment.headcount,
+                schedule_ids=segment.schedule_ids,
+                held_student_ids=segment.held_student_ids,
+                excluded_student_ids=segment.excluded_student_ids,
+            )
+            for segment in scan.excess_segments
+        ]
 
     all_students = set(checkins_by_student) | set(adjustments_by_student)
     students: dict[str, StudentProgress] = {}
@@ -167,9 +311,29 @@ def replay(
         records = checkins_by_student.get(student_id, [])
         adjustments = adjustments_by_student.get(student_id, [])
 
-        confirmed_intervals = [
-            (r.start_utc, r.end_utc) for r in records if r.counts
-        ]
+        if capacity_context:
+            confirmed_intervals = [
+                interval
+                for record in records
+                if record.status == CheckinStatus.CONFIRMED
+                for interval in record.seated_intervals
+            ]
+            held_intervals = [
+                interval for record in records for interval in record.held_intervals
+            ]
+            excluded_intervals = [
+                interval
+                for record in records
+                for interval in record.excluded_intervals
+            ]
+        else:
+            confirmed_intervals = [
+                (r.start_utc, r.end_utc)
+                for r in records
+                if r.status == CheckinStatus.CONFIRMED
+            ]
+            held_intervals = []
+            excluded_intervals = []
         pending_intervals = [
             (r.start_utc, r.end_utc)
             for r in records
@@ -178,6 +342,8 @@ def replay(
 
         confirmed_seconds = union_seconds(confirmed_intervals)
         pending_seconds = union_seconds(pending_intervals)
+        held_seconds = union_seconds(held_intervals)
+        excluded_seconds = union_seconds(excluded_intervals)
         adjustment_seconds = sum(a.seconds for a in adjustments)
         total_seconds = confirmed_seconds + adjustment_seconds
         if total_seconds < 0:
@@ -197,6 +363,40 @@ def replay(
             for day, secs in sorted(day_totals.items())
         ]
 
+        holds: list[CapacityHold] = []
+        if capacity_context:
+            for record in records:
+                for state_name, state_intervals in (
+                    (HELD, record.held_intervals),
+                    (EXCLUDED, record.excluded_intervals),
+                ):
+                    marks = marks_by_checkin.get(record.event_id, [])
+                    for seg_start, seg_end in state_intervals:
+                        match = next(
+                            (
+                                m
+                                for m in marks
+                                if m.state == state_name
+                                and m.start_utc <= seg_start < m.end_utc
+                            ),
+                            None,
+                        )
+                        holds.append(
+                            CapacityHold(
+                                checkin_event_id=record.event_id,
+                                activity_id=record.activity_id,
+                                schedule_id=match.schedule_id if match else "",
+                                venue_id=match.venue_id if match else "",
+                                start_utc=seg_start,
+                                end_utc=seg_end,
+                                seconds=elapsed_seconds(seg_start, seg_end),
+                                state=state_name,
+                                decision_event_id=(
+                                    match.decision_event_id if match else None
+                                ),
+                            )
+                        )
+
         students[student_id] = StudentProgress(
             student_id=student_id,
             confirmed_seconds=confirmed_seconds,
@@ -209,6 +409,9 @@ def replay(
             daily=daily,
             checkins=sorted(records, key=lambda r: r.start_utc),
             adjustments=sorted(adjustments, key=lambda a: a.event_id),
+            held_seconds=held_seconds,
+            excluded_seconds=excluded_seconds,
+            capacity_holds=holds,
         )
 
     return ReplayState(
@@ -216,32 +419,52 @@ def replay(
         timezone=timezone_name,
         required_seconds=required_seconds,
         students=students,
+        overruns=overruns,
     )
 
 
 def explain_checkin(record: CheckinRecord, tz_name: str) -> dict[str, Any]:
     """执行确定性的业务处理。"""
     segments = split_by_academic_day(record.start_utc, record.end_utc, tz_name)
-    return {
+
+    def _iso(value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    explanation = {
         "event_id": record.event_id,
         "activity_id": record.activity_id,
         "activity_type": record.activity_type,
         "status": record.status.value,
         "counts": record.counts,
-        "check_in_at_utc": record.start_utc.astimezone(timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z"),
-        "check_out_at_utc": record.end_utc.astimezone(timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z"),
+        "check_in_at_utc": _iso(record.start_utc),
+        "check_out_at_utc": _iso(record.end_utc),
         "raw_seconds": record.seconds,
         "academic_days": [
             {
                 "day": day.isoformat(),
-                "start_utc": seg_start.isoformat().replace("+00:00", "Z"),
-                "end_utc": seg_end.isoformat().replace("+00:00", "Z"),
+                "start_utc": _iso(seg_start),
+                "end_utc": _iso(seg_end),
                 "seconds": elapsed_seconds(seg_start, seg_end),
             }
             for day, seg_start, seg_end in segments
         ],
     }
+    if record.seated_intervals or record.held_intervals or record.excluded_intervals:
+        explanation["capacity"] = {
+            "seated_seconds": record.seated_seconds,
+            "held_seconds": record.held_seconds,
+            "excluded_seconds": record.excluded_seconds,
+            "seated": [
+                {"start_utc": _iso(s), "end_utc": _iso(e)}
+                for s, e in record.seated_intervals
+            ],
+            "held": [
+                {"start_utc": _iso(s), "end_utc": _iso(e)}
+                for s, e in record.held_intervals
+            ],
+            "excluded": [
+                {"start_utc": _iso(s), "end_utc": _iso(e)}
+                for s, e in record.excluded_intervals
+            ],
+        }
+    return explanation
